@@ -2,6 +2,8 @@ const path = require('path');
 const fs = require('fs-extra');
 const {
 	getFileNameNoExt,
+	getParentFolderName,
+	isInFolder
 } = require('./utils/pathUtil.js');
 
 const jsHandle = require('./wx2uni/jsHandle');
@@ -83,7 +85,11 @@ let fileData = {};
 //路由数据，用来记录对应页面的title和使用的自定义组件
 let routerData = {};
 //素材目录
-let imagesFolder = "";
+let imagesFolder = [];
+//workers目录
+let workersFolder = "";
+
+
 
 /**
  * 遍历目录
@@ -105,14 +111,23 @@ function traverseFolder(folder, miniprogramRoot, targetFolder, callback) {
 			let isContinue = false;
 			fs.stat(fileDir, function (err, stats) {
 				if (stats.isDirectory()) {
-					//console.log(fileDir, fileName);
-					if (fileName == "images" || fileName == "image") {
+					// console.log(fileDir, fileName);
+					//判断是否为页面文件所在的目录（这个判断仍然还不错十分完美~）
+					let isPageFileFolder = fs.existsSync(path.join(fileDir, fileName + ".wxml"));
+					//简单判断是否为workers目录，严格判断需要从app.json里取出workers的路径来(后续再议)
+					let isWorkersFolder = path.relative(miniprogramRoot, fileDir) === "workers";
+					if ((fileName == "images" || fileName == "image") && !isPageFileFolder) {
 						//处理图片目录，复制到static目录里
 						fs.copySync(fileDir, path.join(targetFolder, "static" + "/" + fileName));
-						imagesFolder = fileDir;
+						imagesFolder.push(fileDir);
+					} else if (isWorkersFolder) {
+						//处理workers目录，复制到static目录里
+						fs.copySync(fileDir, path.join(targetFolder, "static" + "/" + fileName));
+						workersFolder = fileDir;
 					} else {
-						//如果不是是素材目录下面的子目录就复制
-						if (imagesFolder && fileDir.indexOf(imagesFolder) > -1) {
+						//如果不是是素材目录或workers目录下面的子目录就复制
+						let isInIgnoreFolder = isInFolder(imagesFolder, fileDir) || (workersFolder && fileDir.indexOf(workersFolder) > -1);
+						if (isInIgnoreFolder) {
 							//
 						} else {
 							fs.mkdirSync(newFileDir);
@@ -125,13 +140,14 @@ function traverseFolder(folder, miniprogramRoot, targetFolder, callback) {
 					if (fileName[0] == '.') {
 
 					} else {
-						//判断是否为素材目录里面的文件
-						if (imagesFolder && fileDir.indexOf(imagesFolder) > -1) {
+						//判断是否为素材目录或workers目录里面的文件
+						let isInIgnoreFolder = isInFolder(imagesFolder, fileDir) || (workersFolder && fileDir.indexOf(workersFolder) > -1);
+						if (isInIgnoreFolder) {
 							//
 						} else {
 							//非素材目录里的文件
 							//这里处理一下，防止目录名与文件名不一致
-							let extname = path.extname(fileName);
+							let extname = path.extname(fileName).toLowerCase();
 							let fileNameNoExt = getFileNameNoExt(fileName);
 							//
 							let obj = {};
@@ -167,13 +183,45 @@ function traverseFolder(folder, miniprogramRoot, targetFolder, callback) {
 									obj["wxss"] = fileDir;
 									break;
 								case ".json":
+									//粗暴获取上层目录的名称~~~
+									let pFolderName = getParentFolderName(fileDir);
+									if (fileNameNoExt !== pFolderName) {
+										fs.copySync(fileDir, newFileDir);
+									}
+
+									///这里要判断是文件名是否为上层目录名，如果是的话就可以
 									obj["json"] = fileDir;
 									break;
 								case ".wxs":
 									fs.copySync(fileDir, path.join(tFolder, fileNameNoExt + ".js"));
 									break;
 								default:
-									fs.copySync(fileDir, newFileDir);
+									console.log(extname, path.dirname(fileDir));
+									console.log(fileDir, path.basename(path.dirname(fileDir)));
+									if (/.(jpg|jpeg|gif|svg|png)$/.test(extname)) {
+										//当前文件上层目录
+										let pFolder = path.dirname(fileDir);
+										//粗暴获取上层目录的名称~~~
+										let pFolderName = path.basename(pFolder);
+										let isHasWxmlFile = fs.existsSync(path.join(pFolder, pFolderName + ".wxml"));
+										let isHasJsFile = fs.existsSync(path.join(pFolder, pFolderName + ".js"));
+										let isHasWxssFile = fs.existsSync(path.join(pFolder, pFolderName + ".wxss"));
+										if (isHasWxmlFile || isHasJsFile || isHasWxssFile) {
+											//直接复制到static目录里
+											let targetFile = path.join(targetFolder, "static" + "/" + fileName);
+											if(fs.existsSync(targetFile))
+											{
+												console.log("遇到同名文件：" + fileName + " 将直接覆盖！");
+											}
+											fs.copySync(fileDir, path.join(targetFolder, "static" + "/" + fileName));
+										} else {
+											fs.copySync(pFolder, path.join(targetFolder, "static" + "/" + pFolderName));
+											imagesFolder.push(pFolder);
+										}
+									} else {
+										fs.copySync(fileDir, newFileDir);
+									}
+
 									// log.path = {
 									// 	...log.path,
 									// 	...newFileDir
@@ -200,7 +248,7 @@ function traverseFolder(folder, miniprogramRoot, targetFolder, callback) {
 async function filesHandle(fileData, miniprogramRoot) {
 	// console.log("--------------", tFolder);
 	try {
-		await new Promise((resolve, reject) => {
+		return await new Promise((resolve, reject) => {
 			let total = Object.keys(fileData).length;
 			let count = 0;
 
@@ -230,21 +278,26 @@ async function filesHandle(fileData, miniprogramRoot) {
 					// * 单个js的情况-->直接复制
 					var extName = "";
 					var hasAllFile = false;
-					var hasJSFile = false;
-					var hasWxssFile = false;
+					var onlyJSFile = false;
+					var onlyWxssFile = false;
+					var onlyWxmlFile = false;
 
-					if ((file_wxml && file_js) || (file_wxss && file_js) || file_wxml) {
+					if ((file_wxml && file_js) || (file_wxss && file_js)) {
 						//当有wxml，那必然会有js文件，可能会有wxss文件，单独的.wxml，转为.vue
 						extName = ".vue";
 						hasAllFile = true;
+					} else if (file_wxml) {
+						//如果只有一个wxml，就当它是一个组件来处理
+						extName = ".vue";
+						onlyWxmlFile = true;
 					} else if (file_js) {
 						//除了上面至少两种文件存在的情况，那么这里就是单独存在的js文件
 						extName = ".js";
-						hasJSFile = true;
+						onlyJSFile = true;
 					} else if (file_wxss) {
 						//与js文件类似，这里只可能是单独存在的wxss文件
 						extName = ".css";
-						hasWxssFile = true;
+						onlyWxssFile = true;
 					}
 					targetFilePath = path.join(tFolder, fileName + extName);
 					if (isAppFile) targetFilePath = path.join(tFolder, "App.vue");
@@ -300,13 +353,38 @@ async function filesHandle(fileData, miniprogramRoot) {
 							console.log(`Convert ${fileName}.vue success!`);
 						});
 					} else {
-						if (hasJSFile) {
+						if (onlyWxmlFile) {
+							//只有wxml文件时，当组件来处理
+							let data_wxml = fs.readFileSync(file_wxml, 'utf8');
+							if (data_wxml) {
+								let data = await wxmlHandle(data_wxml, file_wxml, onlyWxmlFile);
+								fileContent = data;
+								let props = [];
+								if (global.props[file_wxml] && global.props[file_wxml].length > 0) {
+									props = global.props[file_wxml];
+								}
+								fileContent += `
+<script> 
+	export default {
+		props: [${props}]
+	}
+</script> 
+								`;
+
+								//写入文件
+								fs.writeFile(targetFilePath, fileContent, () => {
+									console.log(`Convert component ${fileName}.vue success!`);
+								});
+							}
+						}
+						if (onlyJSFile) {
 							//如果是为单名的js文件，即同一个名字只有js文件，没有wxml或wxss文件，下同
 							if (file_js && fs.existsSync(file_js)) {
 								fs.copySync(file_js, targetFilePath);
 							}
 						}
-						if (hasWxssFile) {
+
+						if (onlyWxssFile) {
 							//读取.wxss文件
 							if (file_wxss && fs.existsSync(file_wxss)) {
 								let data_wxss = fs.readFileSync(file_wxss, 'utf8');
@@ -359,6 +437,12 @@ async function transform(sourceFolder, targetFolder) {
 	global.miniprogramRoot = miniprogramRoot;
 	global.sourceFolder = sourceFolder;
 	global.targetFolder = targetFolder;
+	global.globalUsingComponents = {};  //后面添加的全局组件
+	global.props = {};  //存储wxml组件页面里面，需要对外开放的参数(本想不做全局的，然而传参出现问题，还是全局一把梭)
+	//数据格式，简单粗爆
+	// {
+	// 	"文件路径":[]
+	// }
 
 	//
 	if (fs.existsSync(targetFolder)) {
@@ -379,10 +463,10 @@ async function transform(sourceFolder, targetFolder) {
 		// fs.writeJson("./log.log", log);
 
 		//处理文件组
-		filesHandle(fileData, miniprogramRoot);
-
-		//处理配置文件
-		configHandle(configData, routerData, miniprogramRoot, targetFolder);
+		filesHandle(fileData, miniprogramRoot).then(() => {
+			//处理配置文件
+			configHandle(configData, routerData, miniprogramRoot, targetFolder);
+		});
 	});
 }
 module.exports = transform;
