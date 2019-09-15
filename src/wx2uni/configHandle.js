@@ -2,9 +2,11 @@ const fs = require('fs-extra');
 const path = require('path');
 const t = require('@babel/types');
 const generate = require('@babel/generator').default;
-const {
-	toCamel2
-} = require('../utils/utils.js');
+
+const utils = require('../utils/utils.js');
+const pathUtil = require('../utils/pathUtil.js');
+
+const pinyin = require("node-pinyin");
 
 
 /**
@@ -46,7 +48,7 @@ async function configHandle(configData, routerData, miniprogramRoot, targetFolde
 					"path": pagePath,
 					"style": {
 						"navigationBarTitleText": navigationBarTitleText,
-						"usingComponents": usingComponents
+						// "usingComponents": usingComponents  //组件统一使用import导入，不在这里注册
 					}
 				};
 				pages.push(obj);
@@ -59,6 +61,9 @@ async function configHandle(configData, routerData, miniprogramRoot, targetFolde
 
 			//sitemap.json似乎在uniapp用不上，删除！
 			delete appJson["sitemapLocation"];
+
+			//subPackages显示配置错误，这里删除！
+			delete appJson["subPackages"];
 
 			//usingComponents节点，上面删除缓存，这里删除
 			delete appJson["usingComponents"];
@@ -78,8 +83,8 @@ async function configHandle(configData, routerData, miniprogramRoot, targetFolde
 					 * 而 /pages/images下面的文件是用于页面里的
 					 * 其余情况后面发现再加入
 					 */
-					if (item.iconPath) item.iconPath = "./static/" + item.iconPath;
-					if (item.selectedIconPath) item.selectedIconPath = "./static/" + item.selectedIconPath;
+					if (item.iconPath) item.iconPath = "./static" + item.iconPath;
+					if (item.selectedIconPath) item.selectedIconPath = "./static" + item.selectedIconPath;
 				}
 			}
 
@@ -95,9 +100,10 @@ async function configHandle(configData, routerData, miniprogramRoot, targetFolde
 			let file_manifest = path.join(__dirname, "/template/manifest.json");
 			let manifestJson = fs.readJsonSync(file_manifest);
 			//
-			manifestJson.name = configData.name;
+			let name = pinyin(configData.name, { style: "normal" }).join("");
+			manifestJson.name = name;
 			manifestJson.description = configData.description;
-			manifestJson.versionName = configData.version;
+			manifestJson.versionName = configData.version || "1.0.0";
 			manifestJson["mp-weixin"].appid = configData.appid;
 
 			//manifest.json
@@ -108,7 +114,7 @@ async function configHandle(configData, routerData, miniprogramRoot, targetFolde
 
 
 			////////////////////////////write main.js/////////////////////////////
-			let file_main_temp = path.join(__dirname, "/template/main.js");
+			let file_main_temp = path.join(__dirname, "template/main.js");
 
 			let mainContent = "import Vue from 'vue';\r\n";
 			mainContent += "import App from './App';\r\n\r\n";
@@ -116,15 +122,19 @@ async function configHandle(configData, routerData, miniprogramRoot, targetFolde
 			//全局引入自定义组件
 			//import firstcompoent from '../firstcompoent/firstcompoent'
 			for (const key in globalUsingComponents) {
+				//key可能含有后缀名，也可能是用-连接的，统统转成驼峰
+				let newKey = utils.toCamel2(key);
+				newKey = newKey.split(".vue").join(""); //去掉后缀名
 				let filePath = globalUsingComponents[key];
 				let extname = path.extname(filePath);
 				if(extname) filePath = filePath.replace(extname, ".vue");
-				filePath = filePath.replace(/^\//g, "./"); //相对路径处理
-				let node = t.importDeclaration([t.importDefaultSpecifier(t.identifier(key))], t.stringLiteral(filePath));
+				filePath = filePath.replace(/^\//, "./"); //相对路径处理
+				let node = t.importDeclaration([t.importDefaultSpecifier(t.identifier(newKey))], t.stringLiteral(filePath));
 				mainContent += `${generate(node).code}\r\n`;
 				let name = path.basename(filePath);
-				name = toCamel2(name);
-				mainContent += `Vue.component('${name}', ${key});\r\n\r\n`;
+				name = name.split(".vue").join(""); //去掉后缀名
+				name = utils.toCamel2(name);
+				mainContent += `Vue.component('${name}', ${newKey});\r\n\r\n`;
 			}
 			//
 			mainContent += "Vue.config.productionTip = false;\r\n\r\n";
@@ -138,7 +148,7 @@ async function configHandle(configData, routerData, miniprogramRoot, targetFolde
 			fs.writeFile(file_main, mainContent, () => {
 				console.log(`write ${file_main} success!`);
 			});
-
+					
 			//////////////////////////////////////////////////////////////////////
 			resolve();
 		});

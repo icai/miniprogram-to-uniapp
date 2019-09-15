@@ -11,16 +11,10 @@ const traverse = require('@babel/traverse').default;
 const template = require('@babel/template').default;
 const JavascriptParser = require('./js/JavascriptParser');
 const componentConverter = require('./js/componentConverter');
-const {
-	isURL,
-	toCamel2
-} = require('../utils/utils.js');
+const clone = require('clone');
 
-const {
-	getFileNameNoExt, getParentFolderName
-} = require('../utils/pathUtil.js');
-
-
+const utils = require('../utils/utils.js');
+const pathUtil = require('../utils/pathUtil.js');
 
 /**
  * 将ast属性数组组合为ast对象
@@ -132,7 +126,9 @@ function handleSetData(path, isThis) {
  * 获取setData()的AST
  * 暂未想到其他好的方式来实现将setData插入到methods里。
  */
-function getSetDataFun() {
+var setDataFunAST = null;
+function getSetDataFunAST() {
+	if (setDataFunAST) return clone(setDataFunAST);
 	const code = `
 	var setData = {
 	setData:function(obj){  
@@ -167,48 +163,101 @@ function getSetDataFun() {
 			result = path.node;
 		}
 	});
-
+	setDataFunAST = result;
 	return result;
 }
+
+
+/**
+ * 根据funName在liftCycleArr里查找生命周期函数，找不到就创建一个，给onLoad()里加入wxs所需要的代码
+ * @param {*} liftCycleArr  生命周期函数数组
+ * @param {*} key           用于查找当前编辑的文件组所对应的key
+ * @param {*} funName       函数名："onLoad" or "beforeMount"
+ */
+function handleOnLoadFun(liftCycleArr, key, funName) {
+	var node = null;
+	for (let i = 0; i < liftCycleArr.length; i++) {
+		const obj = liftCycleArr[i];
+		if (obj.key.name == funName) {
+			node = obj;
+			break;
+		}
+	}
+	let wxInfo = global.wxsInfo[key];
+	if (wxInfo) {
+		if (!node) {
+			node = t.objectMethod("method", t.identifier(funName), [], t.blockStatement([]));
+			liftCycleArr.unshift(node);
+		}
+		wxInfo.forEach(obj => {
+			let left = t.memberExpression(t.thisExpression(), t.identifier(obj.name));
+			let right = t.identifier(obj.name);
+			let exp = t.expressionStatement(t.assignmentExpression("=", left, right));
+			if (node.body) {
+				//处理 onLoad() {}
+				node.body.body.unshift(exp);
+			} else {
+				//处理 onLoad: function() {}
+				node.value.body.body.unshift(exp);
+			}
+		});
+	}
+	return node;
+}
+
+
 
 /**
  * 组件模板处理
  * @param {*} ast 
  * @param {*} vistors 
- * @param {*} isApp 是否为app.js文件
+ * @param {*} isApp            是否为app.js文件
  * @param {*} usingComponents  使用的自定义组件列表
+ * @param {*} isPage           判断当前文件是Page还是Component(还有第三种可能->App，划分到Page)
+ * @param {*} wxsKey           获取当前文件wxs信息的key
+ * @param {*} file_js          当前转换的文件路径
+ * @param {*} isSingleFile     表示是否为单个js文件，而不是vue文件一部分
  */
-const componentTemplateBuilder = function (ast, vistors, isApp, usingComponents) {
+const componentTemplateBuilder = function (ast, vistors, isApp, usingComponents, isPage, wxsKey, file_js, isSingleFile) {
 	let buildRequire = null;
 
-	//插入setData()
-	const node = getSetDataFun();
-	vistors.methods.handle(node);
-	//
-	if (isApp) {
-		//是app.js文件,要单独处理
-		buildRequire = template(componentTemplateApp);
-		//app.js目前看到有data属性的，其余的还未看到。
-		ast = buildRequire({
-			DATA: arrayToObject(vistors.data.getData()),
-			METHODS: arrayToObject(vistors.methods.getData())
-		});
-	} else {
-		//非app.js文件
-		buildRequire = template(componentTemplate);
+	if (!isSingleFile) {
+		//插入setData()
+		const node = getSetDataFunAST();
+		vistors.methods.handle(node);
 
-		ast = buildRequire({
-			PROPS: arrayToObject(vistors.props.getData()),
-			DATA: arrayToObject(vistors.data.getData()),
-			METHODS: arrayToObject(vistors.methods.getData()),
-			COMPUTED: arrayToObject(vistors.computed.getData()),
-			WATCH: arrayToObject(vistors.watch.getData()),
-		});
+		//
+		if (isApp) {
+			//是app.js文件,要单独处理
+			buildRequire = template(componentTemplateApp);
+			//app.js目前看到有data属性的，其余的还未看到。
+			ast = buildRequire({
+				DATA: arrayToObject(vistors.data.getData()),
+				METHODS: arrayToObject(vistors.methods.getData())
+			});
+		} else {
+			//非app.js文件
+			buildRequire = template(componentTemplate);
+
+			ast = buildRequire({
+				PROPS: arrayToObject(vistors.props.getData()),
+				DATA: arrayToObject(vistors.data.getData()),
+				METHODS: arrayToObject(vistors.methods.getData()),
+				COMPUTED: arrayToObject(vistors.computed.getData()),
+				WATCH: arrayToObject(vistors.watch.getData()),
+			});
+
+			if (global.isTransformWXS) {
+				//处理wxs里变量的引用问题
+				let liftCycleArr = vistors.lifeCycle.getData();
+				let funName = "beforeMount";
+				if (isPage) funName = "onLoad";
+				handleOnLoadFun(liftCycleArr, wxsKey, funName);
+			}
+		}
 	}
 
-
-
-
+	let fileDir = nodePath.dirname(file_js);
 	//久久不能遍历，搜遍google，template也没有回调，后面想着源码中应该会有蛛丝马迹，果然，在templateVisitor里找到了看到这么一个属性noScope，有点嫌疑
 	//noScope: 从babel-template.js中发现这么一个属性，因为直接转出来的ast进行遍历时会报错，找了官方文档，没有这个属性的介绍信息。。。
 	//Error: You must pass a scope and parentPath unless traversing a Program/File. Instead of that you tried to traverse a ExportDefaultDeclaration node without passing scope and parentPath.
@@ -223,7 +272,7 @@ const componentTemplateBuilder = function (ast, vistors, isApp, usingComponents)
 		ObjectMethod(path) {
 			// console.log("--------", path.node.key.name);
 			if (path.node.key.name === 'data') {
-				var liftCycleArr = vistors.lifeCycle.getData();
+				let liftCycleArr = vistors.lifeCycle.getData();
 				for (let key in liftCycleArr) {
 					// console.log(liftCycleArr[key]);
 					path.insertAfter(liftCycleArr[key]);
@@ -256,7 +305,7 @@ const componentTemplateBuilder = function (ast, vistors, isApp, usingComponents)
 				// }
 				for (const key in usingComponents) {
 					//中划线转驼峰
-					let componentName = toCamel2(key);
+					let componentName = utils.toCamel2(key);
 
 					//这里两个小优化空间
 					//1.是否有其他操作这个数组方式
@@ -286,22 +335,34 @@ const componentTemplateBuilder = function (ast, vistors, isApp, usingComponents)
 						arguments[0] = t.stringLiteral("./static/" + val);
 					}
 				}
+			} else if (t.isIdentifier(callee, { name: "require" })) {
+				//处理require()路径
+				let arguments = path.node.arguments;
+				if (arguments && arguments.length) {
+					if (t.isStringLiteral(arguments[0])) {
+						let filePath = arguments[0].value;
+						filePath = pathUtil.relativePath(filePath, global.miniprogramRoot, fileDir);
+						path.node.arguments[0] = t.stringLiteral(filePath);
+					}
+				}
 			}
 		},
 		MemberExpression(path) {
 			let object = path.get('object');
 			let property = path.get('property');
 
-			//this.triggerEvent()转换为this.$emit()
 			if (t.isIdentifier(property.node, { name: "triggerEvent" })) {
-				let obj = t.memberExpression(object, t.identifier("$emit"));
+				//this.triggerEvent()转换为this.$emit()
+				let obj = t.memberExpression(object.node, t.identifier("$emit"));
 				path.replaceWith(obj);
-			}
-
-			//将this.data.xxx转换为this.xxx
-			if (t.isIdentifier(property.node, { name: "data" })) {
-				if (t.isThisExpression(object) || t.isIdentifier(object.node, { name: "that" }) || t.isIdentifier(object.node, { name: "_this" })) {
-					path.replaceWith(object);
+			} else if (t.isIdentifier(property.node, { name: "data" })) {
+				//将this.data.xxx转换为this.xxx
+				if (t.isThisExpression(object) || t.isIdentifier(object.node, { name: "that" }) || t.isIdentifier(object.node, { name: "_this" }) || t.isIdentifier(object.node, { name: "self" })) {
+					let parent = path.parent;
+					//如果父级是AssignmentExpression，则不需再进行转换
+					if (!t.isAssignmentExpression(parent)) {
+						path.replaceWith(object);
+					}
 				}
 			}
 
@@ -384,22 +445,20 @@ function handleJSImage(ast, file_js) {
 			}
 
 			//忽略网络素材地址，不然会转换出错
-			if (src && !isURL(src) && reg.test(src)) {
+			if (src && !utils.isURL(src) && reg.test(src)) {
 				//static路径
 				let staticPath = nodePath.join(global.miniprogramRoot, "static");
 
 				//当前处理文件所在目录
 				let jsFolder = nodePath.dirname(file_js);
-				var pFolderName = getParentFolderName(src);
+				var pFolderName = pathUtil.getParentFolderName(src);
 				var fileName = nodePath.basename(src);
 
 				let filePath = nodePath.resolve(staticPath, "./" + pFolderName + "/" + fileName);
 				let newImagePath = nodePath.relative(jsFolder, filePath);
 
 				path.node = t.stringLiteral(newImagePath);
-
-				console.log("newImagePath ", newImagePath);
-
+				// console.log("newImagePath ", newImagePath);
 			}
 		},
 	});
@@ -413,8 +472,9 @@ function handleJSImage(ast, file_js) {
  * @param {*} usingComponents   使用的自定义组件列表
  * @param {*} miniprogramRoot   小程序目录
  * @param {*} file_js           当前处理的文件路径
+ * @param {*} isSingleFile      表示是否为单个js文件，而不是vue文件一部分
  */
-async function jsHandle(fileData, isApp, usingComponents, miniprogramRoot, file_js) {
+async function jsHandle(fileData, isApp, usingComponents, miniprogramRoot, file_js, isSingleFile) {
 	//先反转义
 	let javascriptContent = fileData;
 
@@ -424,18 +484,40 @@ async function jsHandle(fileData, isApp, usingComponents, miniprogramRoot, file_
 	//去除无用代码
 	javascriptContent = javascriptParser.beforeParse(javascriptContent);
 
-	//解析成AST
-	let javascriptAst = await javascriptParser.parse(javascriptContent);
+	let javascriptAst = null;
+	try {
+		//解析成AST
+		javascriptAst = await javascriptParser.parse(javascriptContent);
+	} catch (error) {
+		console.log("Error: 解析文件出错: ", file_js);
+		global.log.push("Error: 解析文件出错: ", file_js);
+	}
 
 	//进行代码转换
 	let {
 		convertedJavascript,
 		vistors,
-		declareStr
+		declareStr,
+		isPage
 	} = componentConverter(javascriptAst, miniprogramRoot, file_js);
 
-	//处理js里面的资源路径
-	handleJSImage(javascriptAst, file_js);
+	if (!global.isVueAppCliMode) {
+		//处理js里面的资源路径
+		handleJSImage(javascriptAst, file_js);
+	}
+
+	let wxsKey = "";
+	if (global.isTransformWXS) {
+		//添加wxs引用
+		wxsKey = nodePath.join(nodePath.dirname(file_js), pathUtil.getFileNameNoExt(file_js));
+		let wxInfo = global.wxsInfo[wxsKey];
+		if (wxInfo) {
+			wxInfo.forEach(obj => {
+				if (obj.type == "link") declareStr += `import ${obj.name} from '${obj.src}'\r\n`;
+			});
+		}
+	}
+
 
 	//引入自定义组件
 	//import firstcompoent from '../firstcompoent/firstcompoent'
@@ -461,22 +543,25 @@ async function jsHandle(fileData, isApp, usingComponents, miniprogramRoot, file_
 		}
 
 		//中划线转驼峰
-		let componentName = toCamel2(key);
+		let componentName = utils.toCamel2(key);
 		//
 		let node = t.importDeclaration([t.importDefaultSpecifier(t.identifier(componentName))], t.stringLiteral(filePath));
 		declareStr += `${generate(node).code}\r\n`;
 	}
 
 	//放到预先定义好的模板中
-	convertedJavascript = componentTemplateBuilder(javascriptAst, vistors, isApp, usingComponents);
+	convertedJavascript = componentTemplateBuilder(javascriptAst, vistors, isApp, usingComponents, isPage, wxsKey, file_js, isSingleFile);
 
 
 	// console.log(`${generate(convertedJavascript).code}`);
 
-
 	//生成文本并写入到文件
-	let codeText = `<script>\r\n${declareStr}\r\n${generate(convertedJavascript).code}\r\n</script>\r\n`;
-
+	let codeText = "";
+	if (isSingleFile) {
+		codeText = `${generate(convertedJavascript).code}`;
+	} else {
+		codeText = `<script>\r\n${declareStr}\r\n${generate(convertedJavascript).code}\r\n</script>\r\n`;
+	}
 
 	// console.log(codeText);
 	return codeText;

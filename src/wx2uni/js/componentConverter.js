@@ -4,6 +4,7 @@ const generate = require('@babel/generator').default;
 const traverse = require('@babel/traverse').default;
 const Vistor = require("./Vistor");
 const clone = require('clone');
+const pathUtil = require('../../utils/pathUtil');
 
 
 const lifeCycleFunction = {
@@ -39,28 +40,66 @@ let dataValue = {};
 let computedValue = {};
 //wacth对象
 let watchValue = {};
+//判断当前文件类型，true表示页面，false表示组件
+let isPage = true;
 
 //工作目录
 let miniprogramRoot = "";
 //当前处理的js文件路径
 let file_js = "";
+//当前文件所在目录
+let fileDir = "";
+
+
 /*
  *
  * 注：为防止深层遍历，将直接路过子级遍历，所以使用enter进行全遍历时，孙级节点将跳过
  * 
  */
 const componentVistor = {
+	ExpressionStatement(path) {
+		//判断当前文件是Page还是Component(还有第三种可能->App，划分到Page)
+		if (t.isProgram(path.parent)) {
+			let callee = path.get('expression.callee');
+			//这里不严谨，有等于App的情况，按页面处理得了
+			if (callee && callee.node && t.isIdentifier(callee.node, { name: "Component" })) {
+				isPage = false;
+			}
+		}
+	},
 	ImportDeclaration(path) {
 		//定义的导入的模块
 		// vistors.importDec.handle(path.node);
 		//
+		//处理import模板的路径，转换当前路径以及根路径为相对路径
+		let filePath = path.node.source.value;
+		filePath = nodePath.join(nodePath.dirname(filePath), pathUtil.getFileNameNoExt(filePath)); //去掉扩展名
+		filePath = pathUtil.relativePath(filePath, global.miniprogramRoot, fileDir);
+		path.node.source.value = filePath;
+
 		//处理导入的是wxss的情况，替换.wxss为.css即可。
 		var str = `${generate(path.node).code}\r\n`;
-		str = str.split(".wxss").join(".css");
 		//
 		declareStr += str;
 	},
 	VariableDeclaration(path) {
+		//将require()里的地址都处理一遍
+		traverse(path.node, {
+			noScope: true,
+			CallExpression(path) {
+				let callee = path.node.callee;
+				if (t.isIdentifier(callee, { name: "require" })) {
+					let arguments = path.node.arguments;
+					if (arguments && arguments.length) {
+						if (t.isStringLiteral(arguments[0])) {
+							let filePath = arguments[0].value;
+							filePath = pathUtil.relativePath(filePath, global.miniprogramRoot, fileDir);
+							path.node.arguments[0] = t.stringLiteral(filePath);
+						}
+					}
+				}
+			}
+		});
 		const parent = path.parentPath.parent;
 		if (t.isFile(parent)) {
 			//定义的外部变量
@@ -137,10 +176,17 @@ const componentVistor = {
 				vistors.lifeCycle.handle(path.node);
 				break;
 			case 'attached':
-				//组件特有生命周期: attached-->onLoad
-				let newPath = clone(path);
-				newPath.node.key.name = "onLoad";
-				vistors.lifeCycle.handle(newPath.node);
+				//组件特有生命周期: attached-->beforeMount
+				let newPath_a = clone(path);
+				newPath_a.node.key.name = "beforeMount";
+				vistors.lifeCycle.handle(newPath_a.node);
+				path.skip();
+				break;
+			case 'moved':
+				//组件特有生命周期: moved-->moved  //这个vue没有对应的生命周期
+				let newPath_m = clone(path);
+				newPath_m.node.key.name = "moved";
+				vistors.lifeCycle.handle(newPath_m.node);
 				path.skip();
 				break;
 			case 'properties':
@@ -199,8 +245,11 @@ const componentConverter = function (ast, _miniprogramRoot, _file_js) {
 	//wacth对象
 	watchValue = {};
 	//
+	isPage = true;
+	//
 	miniprogramRoot = _miniprogramRoot;
 	file_js = _file_js;
+	fileDir = nodePath.dirname(file_js);
 	//
 	vistors = {
 		props: new Vistor(),
@@ -216,7 +265,8 @@ const componentConverter = function (ast, _miniprogramRoot, _file_js) {
 	return {
 		convertedJavascript: traverse(ast, componentVistor),
 		vistors: vistors,
-		declareStr //定义的变量和导入的模块声明
+		declareStr, //定义的变量和导入的模块声明
+		isPage
 	}
 }
 
