@@ -1,5 +1,15 @@
 test
+demo
 node_modules
-package-lock.json
 .history/
 .vscode/
+*.zip
+.DS_Store
+plugins
+.idea
+TODO.md
+docs/
+# vuepress temp file
+.temp
+next
+.github
